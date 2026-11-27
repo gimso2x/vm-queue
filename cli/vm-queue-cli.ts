@@ -101,6 +101,48 @@ function parseOptionalInt(
   return num;
 }
 
+function parseOptionalNumber(
+  raw: string | undefined,
+  name: string,
+  min?: number,
+  max?: number,
+): number | undefined {
+  if (raw === undefined) return undefined;
+  if (raw.trim() === "") {
+    throw new Error(`Invalid number for --${name}: ${raw}`);
+  }
+  const num = Number(raw);
+  if (!Number.isFinite(num)) {
+    throw new Error(`Invalid number for --${name}: ${raw}`);
+  }
+  if (min !== undefined && num < min) {
+    throw new Error(`--${name} must be >= ${min}`);
+  }
+  if (max !== undefined && num > max) {
+    throw new Error(`--${name} must be <= ${max}`);
+  }
+  return num;
+}
+
+function parseCsvList(raw: string | undefined, name: string): string[] | undefined {
+  if (raw === undefined) return undefined;
+  const parts = raw.split(",").map((item) => item.trim());
+  if (parts.length === 0 || parts.some((p) => !p)) {
+    throw new Error(`Invalid comma-separated list for --${name}`);
+  }
+  return parts;
+}
+
+function readRequiredTextFile(filePath: string | undefined, flagName: string): string {
+  if (!filePath) {
+    throw new Error(`--${flagName} is required`);
+  }
+  if (!existsSync(filePath)) {
+    throw new Error(`File not found for --${flagName}: ${filePath}`);
+  }
+  return readFileSync(filePath, "utf8");
+}
+
 function usageText(): string {
   return [
     "Usage: bun run cli/vm-queue-cli.ts [global-flags] <subcommand> [flags]",
@@ -112,6 +154,8 @@ function usageText(): string {
     "Subcommands:",
     "  submit-probe [--job-id <id>] [--ttl <sec>] [--wait <sec>]",
     "  submit-repo-check --repo <https://github.com/owner/repo> [--preset <preset>] [--ref <ref>] [--timeout <sec>] [--job-id <id>] [--ttl <sec>] [--wait <sec>]",
+    "  submit-backtest --repo <https://github.com/owner/repo> --strategy <name> --timerange <YYYYMMDD-YYYYMMDD> [--mode backtest|hyperopt] [--exchange <name>] [--timeframe <tf>] [--pairs <p1,p2>] [--epochs <n>] [--spaces <s1,s2>] [--hyperopt-loss <loss>] [--stake-amount <n>] [--max-open-trades <n>] [--ref <ref>] [--timeout <sec>] [--job-id <id>] [--ttl <sec>] [--wait <sec>]",
+    "  submit-qa --repo <https://github.com/owner/repo> --scenario-id <id> --scenario-name <name> --brief-file <path> --task-file <path> [--lessons-file <path>] [--ref <ref>] [--model <id>] [--phase1 <sec>] [--wrap <sec>] [--tools <csv>] [--job-id <id>] [--ttl <sec>] [--wait <sec>]",
     "  offload --repo <https://github.com/owner/repo> [--preset <preset>] [--ref <ref>] [--timeout <sec>] [--job-id <id>] [--ttl <sec>] [--wait <sec>] [--window <sec>] [--public-url <url>]",
     "  workers [--window <sec>]",
     "  status <job_id>",
@@ -272,7 +316,7 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
       }
       const preset = parsed.flags.preset ?? "auto";
       const ttl = parseOptionalInt(parsed.flags.ttl, "ttl", 1, 86400);
-      const timeoutSec = parseOptionalInt(parsed.flags.timeout, "timeout", 10, 600);
+      const timeoutSec = parseOptionalInt(parsed.flags.timeout, "timeout", 10, 1800);
       const waitSec = parseOptionalInt(parsed.flags.wait, "wait", 1, 1800) ?? 180;
       const windowSec = parseOptionalInt(parsed.flags.window, "window", 5, 3600) ?? 90;
 
@@ -387,7 +431,7 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
       }
       const preset = parsed.flags.preset ?? "auto";
       const ttl = parseOptionalInt(parsed.flags.ttl, "ttl", 1, 86400);
-      const timeoutSec = parseOptionalInt(parsed.flags.timeout, "timeout", 10, 600);
+      const timeoutSec = parseOptionalInt(parsed.flags.timeout, "timeout", 10, 1800);
       waitSec = parseOptionalInt(parsed.flags.wait, "wait", 1, 1800);
       method = "POST";
       path = "/jobs";
@@ -400,6 +444,82 @@ export async function runCli(argv: string[], io: CliIO = {}): Promise<number> {
           preset,
           ...(parsed.flags.ref ? { ref: parsed.flags.ref } : {}),
           ...(timeoutSec !== undefined ? { timeout_sec: timeoutSec } : {}),
+        },
+      };
+    } else if (cmd === "submit-backtest") {
+      const repoUrl = parsed.flags.repo;
+      const strategy = parsed.flags.strategy;
+      const timerange = parsed.flags.timerange;
+      if (!repoUrl || !strategy || !timerange) {
+        throw new Error("submit-backtest requires --repo, --strategy, and --timerange");
+      }
+      const ttl = parseOptionalInt(parsed.flags.ttl, "ttl", 1, 86400);
+      const epochs = parseOptionalInt(parsed.flags.epochs, "epochs", 1, 200);
+      const stakeAmount = parseOptionalNumber(parsed.flags["stake-amount"], "stake-amount", 10, 100000);
+      const maxOpenTrades = parseOptionalInt(parsed.flags["max-open-trades"], "max-open-trades", 1, 20);
+      const timeoutSec = parseOptionalInt(parsed.flags.timeout, "timeout", 60, 3600);
+      const pairs = parseCsvList(parsed.flags.pairs, "pairs");
+      const spaces = parseCsvList(parsed.flags.spaces, "spaces");
+      waitSec = parseOptionalInt(parsed.flags.wait, "wait", 1, 3600);
+      method = "POST";
+      path = "/jobs";
+      bodyObj = {
+        kind: "freqtrade_backtest",
+        ...(parsed.flags["job-id"] ? { job_id: parsed.flags["job-id"] } : {}),
+        ...(ttl !== undefined ? { ttl_sec: ttl } : {}),
+        input: {
+          repo_url: repoUrl,
+          strategy,
+          timerange,
+          ...(parsed.flags.ref ? { ref: parsed.flags.ref } : {}),
+          ...(parsed.flags.mode ? { mode: parsed.flags.mode } : {}),
+          ...(parsed.flags.exchange ? { exchange: parsed.flags.exchange } : {}),
+          ...(parsed.flags.timeframe ? { timeframe: parsed.flags.timeframe } : {}),
+          ...(pairs ? { pairs } : {}),
+          ...(epochs !== undefined ? { epochs } : {}),
+          ...(spaces ? { spaces } : {}),
+          ...(parsed.flags["hyperopt-loss"] ? { hyperopt_loss: parsed.flags["hyperopt-loss"] } : {}),
+          ...(stakeAmount !== undefined ? { stake_amount: stakeAmount } : {}),
+          ...(maxOpenTrades !== undefined ? { max_open_trades: maxOpenTrades } : {}),
+          ...(timeoutSec !== undefined ? { timeout_sec: timeoutSec } : {}),
+        },
+      };
+    } else if (cmd === "submit-qa") {
+      const repoUrl = parsed.flags.repo;
+      const scenarioId = parsed.flags["scenario-id"];
+      const scenarioName = parsed.flags["scenario-name"];
+      if (!repoUrl || !scenarioId || !scenarioName) {
+        throw new Error(
+          "submit-qa requires --repo, --scenario-id, and --scenario-name",
+        );
+      }
+      const brief = readRequiredTextFile(parsed.flags["brief-file"], "brief-file");
+      const task = readRequiredTextFile(parsed.flags["task-file"], "task-file");
+      const lessons = parsed.flags["lessons-file"]
+        ? readRequiredTextFile(parsed.flags["lessons-file"], "lessons-file")
+        : undefined;
+      const ttl = parseOptionalInt(parsed.flags.ttl, "ttl", 1, 86400);
+      const phase1Sec = parseOptionalInt(parsed.flags.phase1, "phase1", 30, 3600);
+      const wrapSec = parseOptionalInt(parsed.flags.wrap, "wrap", 0, 900);
+      waitSec = parseOptionalInt(parsed.flags.wait, "wait", 1, 3600);
+      method = "POST";
+      path = "/jobs";
+      bodyObj = {
+        kind: "qa_scenario",
+        ...(parsed.flags["job-id"] ? { job_id: parsed.flags["job-id"] } : {}),
+        ...(ttl !== undefined ? { ttl_sec: ttl } : {}),
+        input: {
+          repo_url: repoUrl,
+          scenario_id: scenarioId,
+          scenario_name: scenarioName,
+          brief,
+          task,
+          ...(lessons !== undefined ? { lessons } : {}),
+          ...(parsed.flags.ref ? { ref: parsed.flags.ref } : {}),
+          ...(parsed.flags.model ? { model: parsed.flags.model } : {}),
+          ...(phase1Sec !== undefined ? { phase1_sec: phase1Sec } : {}),
+          ...(wrapSec !== undefined ? { wrap_sec: wrapSec } : {}),
+          ...(parsed.flags.tools ? { tools: parsed.flags.tools } : {}),
         },
       };
     } else if (cmd === "workers") {

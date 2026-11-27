@@ -278,4 +278,113 @@ describe("vm-queue-cli", () => {
     expect(code).toBe(2);
     expect(err.join("\n")).toContain("VM_QUEUE_ADMIN_TOKEN");
   });
+
+  test("submits freqtrade_backtest and qa_scenario jobs cleanly", async () => {
+    const { baseUrl, dir } = startApp();
+    const envPath = join(dir, ".env");
+    writeFileSync(
+      envPath,
+      `VM_QUEUE_ADMIN_TOKEN=${ADMIN_TOKEN}\nVM_QUEUE_URL=${baseUrl}\n`,
+      "utf8",
+    );
+    const briefPath = join(dir, "brief.md");
+    const taskPath = join(dir, "task.md");
+    const lessonsPath = join(dir, "lessons.md");
+    writeFileSync(briefPath, "# QA Brief\n", "utf8");
+    writeFileSync(taskPath, "Test config handling\n", "utf8");
+    writeFileSync(lessonsPath, "- Lesson 1\n", "utf8");
+
+    const out: string[] = [];
+    const err: string[] = [];
+    const run = (argv: string[]) =>
+      runCli(argv, {
+        env: {},
+        homeDir: dir,
+        stdout: (line) => out.push(line),
+        stderr: (line) => err.push(line),
+      });
+
+    expect(
+      await run([
+        "--env-file",
+        envPath,
+        "submit-backtest",
+        "--job-id",
+        "cli-bt-1",
+        "--repo",
+        "https://github.com/example-org/sample-strategy",
+        "--strategy",
+        "SampleStrategy",
+        "--timerange",
+        "20250101-20250201",
+        "--mode",
+        "hyperopt",
+        "--pairs",
+        "BTC/USDT,ETH/USDT",
+        "--epochs",
+        "25",
+        "--spaces",
+        "buy,sell",
+        "--stake-amount",
+        "50",
+        "--max-open-trades",
+        "2",
+      ]),
+    ).toBe(0);
+    expect(JSON.parse(out.at(-1)!).kind).toBe("freqtrade_backtest");
+
+    expect(
+      await run([
+        "--env-file",
+        envPath,
+        "submit-qa",
+        "--job-id",
+        "cli-qa-1",
+        "--repo",
+        "https://github.com/example-org/sample-repo",
+        "--scenario-id",
+        "01",
+        "--scenario-name",
+        "config check",
+        "--brief-file",
+        briefPath,
+        "--task-file",
+        taskPath,
+        "--lessons-file",
+        lessonsPath,
+        "--model",
+        "deepseek-v4.1-flash:max",
+        "--phase1",
+        "600",
+        "--wrap",
+        "120",
+        "--tools",
+        "read,bash,grep",
+      ]),
+    ).toBe(0);
+    expect(JSON.parse(out.at(-1)!).kind).toBe("qa_scenario");
+
+    // Missing brief file fails cleanly with code 2
+    expect(
+      await run([
+        "--env-file",
+        envPath,
+        "submit-qa",
+        "--repo",
+        "https://github.com/example-org/sample-repo",
+        "--scenario-id",
+        "02",
+        "--scenario-name",
+        "missing file",
+        "--brief-file",
+        join(dir, "nope.md"),
+        "--task-file",
+        taskPath,
+      ]),
+    ).toBe(2);
+
+    const allLogs = [...out, ...err].join("\n");
+    expect(allLogs).not.toContain(ADMIN_TOKEN);
+    expect(allLogs).not.toContain(WORKER_TOKEN);
+  });
 });
