@@ -1,0 +1,32 @@
+{
+  "tagOwners": {
+    "tag:oci": ["autogroup:admin"],
+    "tag:worker": ["autogroup:admin"]
+  },
+  "acls": [],
+  "grants": [
+    {
+      "src": ["autogroup:member"],
+      "dst": ["autogroup:self"],
+      "ip": ["*"]
+    },
+    {
+      "src": ["autogroup:member"],
+      "dst": ["tag:oci", "tag:worker"],
+      "ip": ["*"]
+    },
+    {
+      "src": ["tag:worker"],
+      "dst": ["tag:oci"],
+      "ip": ["tcp:8790"]
+    }
+  ],
+  "ssh": [
+    {
+      "action": "check",
+      "src": ["autogroup:member"],
+      "dst": ["autogroup:self"],
+      "users": ["autogroup:nonroot", "root"]
+    }
+  ]
+}

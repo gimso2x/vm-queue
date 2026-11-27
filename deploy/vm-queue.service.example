@@ -1,0 +1,14 @@
+[Unit]
+Description=vm-queue Pull Queue for Tailscale Worker VMs
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/services/vm-queue
+EnvironmentFile=%h/services/vm-queue/.env
+ExecStart=/usr/local/bin/bun run %h/services/vm-queue/index.ts
+Restart=always
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=default.target

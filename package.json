@@ -1,0 +1,14 @@
+{
+  "name": "vm-queue",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run index.ts",
+    "test": "bun test",
+    "cli": "bun run cli/vm-queue-cli.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
