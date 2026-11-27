@@ -116,6 +116,10 @@ class VmWorkerUnitTest(unittest.TestCase):
                 str(root), {}, "tok", available_tools=set()
             )
             self.assertEqual((p, reason), ("git_info", "toolchain_not_installed:bun"))
+            p, reason, _ = vm_worker.detect_auto_preset(
+                str(root), {}, "tok", available_tools={"npm"}
+            )
+            self.assertEqual((p, reason), ("npm_test", None))
             (root / "package.json").unlink()
 
             # pyproject.toml -> pytest or fallback
@@ -150,6 +154,242 @@ class VmWorkerUnitTest(unittest.TestCase):
             ["--url", "http://127.0.0.1:8790", "--max-idle-sec", "7200"]
         )
         self.assertEqual(code, 2)
+
+    def test_validate_freqtrade_and_qa_inputs(self) -> None:
+        valid_ft = vm_worker.validate_freqtrade_backtest_input(
+            {
+                "repo_url": "https://github.com/example-org/sample-strategy",
+                "strategy": "SampleStrategy",
+                "timerange": "20250101-20250201",
+            }
+        )
+        self.assertEqual(valid_ft["mode"], "backtest")
+        self.assertEqual(valid_ft["exchange"], "binance")
+
+        for bad_ft in (
+            {
+                "repo_url": "https://github.com/org/repo",
+                "strategy": "SampleStrategy",
+                "timerange": "20250201-20250101",
+            },
+            {
+                "repo_url": "https://github.com/org/repo",
+                "strategy": "1bad",
+                "timerange": "20250101-20250201",
+            },
+            {
+                "repo_url": "https://github.com/org/repo",
+                "strategy": "SampleStrategy",
+                "timerange": "20250101-20250201",
+                "pairs": ["bad_pair"],
+            },
+        ):
+            with self.assertRaises(vm_worker.WorkerInfraError):
+                vm_worker.validate_freqtrade_backtest_input(bad_ft)
+
+        valid_qa = vm_worker.validate_qa_scenario_input(
+            {
+                "repo_url": "https://github.com/example-org/sample-repo",
+                "scenario_id": "01",
+                "scenario_name": "config test",
+                "brief": "Brief",
+                "task": "Task",
+                "model": "deepseek-v4.1-flash:max",
+                "tools": "read,bash,grep",
+            }
+        )
+        self.assertEqual(valid_qa["tools"], "read,bash,grep")
+
+        for bad_qa in (
+            {
+                "repo_url": "https://github.com/example-org/sample-repo",
+                "scenario_id": "01",
+                "scenario_name": "paid",
+                "brief": "Brief",
+                "task": "Task",
+                "model": "anthropic/claude-sonnet-4-5",
+            },
+            {
+                "repo_url": "https://github.com/example-org/sample-repo",
+                "scenario_id": "01",
+                "scenario_name": "disallowed tool",
+                "brief": "Brief",
+                "task": "Task",
+                "tools": "read,task",
+            },
+        ):
+            with self.assertRaises(vm_worker.WorkerInfraError):
+                vm_worker.validate_qa_scenario_input(bad_qa)
+
+    def test_repo_index_collects_stats_and_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            (repo / "src" / "core").mkdir(parents=True)
+            (repo / "README.md").write_text("# Demo\nLine 2\n", encoding="utf-8")
+            (repo / "src" / "core" / "app.ts").write_text(
+                "export class App {}\nexport function runApp() {\n  return 1;\n}\n",
+                encoding="utf-8",
+            )
+            (repo / "src" / "core" / "helper.ts").write_text(
+                "export function ping() {\n  return 'ok';\n}\n",
+                encoding="utf-8",
+            )
+            (repo / "src" / "worker.py").write_text(
+                "def helper():\n    pass\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+            out = vm_worker.process_repo_check(
+                {"repo_url": "https://github.com/example-org/sample-repo", "preset": "repo_index"},
+                token="tok-dummy-0123456789abcdef",
+                clean_env=vm_worker.build_clean_env(),
+                clone_fn=lambda _u, d, _r, e, t, k: vm_worker.clone_github_repo(
+                    str(repo), d, None, e, t, k
+                ),
+            )
+            self.assertTrue(out["passed"])
+            self.assertEqual(out["resolved_preset"], "repo_index")
+            idx = out["index"]
+            self.assertEqual(idx["file_count"], 4)
+            self.assertEqual(idx["total_lines"], 11)
+            self.assertEqual(idx["symbol_counts"]["functions"], 3)
+            self.assertEqual(idx["symbol_counts"]["classes_types"], 1)
+            self.assertEqual(idx["top_directories"][0], {"dir": "src/core", "files": 2})
+
+            # bun_build without scripts.build fails gracefully without crashing
+            (repo / "package.json").write_text(json.dumps({"name": "demo"}), encoding="utf-8")
+            subprocess.run(["git", "add", "package.json"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "pkg"], cwd=repo, check=True, capture_output=True)
+            build_out = vm_worker.process_repo_check(
+                {"repo_url": "https://github.com/example-org/sample-repo", "preset": "bun_build"},
+                token="tok-dummy-0123456789abcdef",
+                clean_env=vm_worker.build_clean_env(),
+                clone_fn=lambda _u, d, _r, e, t, k: vm_worker.clone_github_repo(
+                    str(repo), d, None, e, t, k
+                ),
+            )
+            self.assertFalse(build_out["passed"])
+            self.assertIn("no scripts.build", build_out["summary"])
+
+    def test_resolve_worker_kinds(self) -> None:
+        clean_env = {"PATH": "/nonexistent"}
+        self.assertEqual(
+            vm_worker.resolve_worker_kinds("auto", clean_env, llm_env={}),
+            ["probe", "repo_check"],
+        )
+        self.assertEqual(
+            vm_worker.resolve_worker_kinds("probe,qa_scenario,probe", clean_env),
+            ["probe", "qa_scenario"],
+        )
+        with self.assertRaises(ValueError):
+            vm_worker.resolve_worker_kinds("probe,bad_kind", clean_env)
+
+    def test_freqtrade_and_qa_scenario_mock_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "sample-repo"
+            repo.mkdir()
+            (repo / "README.md").write_text("# Sample\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+            cloner = lambda _u, d, _r, e, t, k: vm_worker.clone_github_repo(
+                str(repo), d, None, e, t, k
+            )
+
+            # Mock freqtrade executable verifying config.json dry_run & empty keys
+            ft_bin = root / "mock_freqtrade.py"
+            ft_bin.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "from pathlib import Path\n"
+                "cmd = sys.argv[1]\n"
+                "cfg_idx = sys.argv.index('--config') + 1\n"
+                "cfg = json.loads(Path(sys.argv[cfg_idx]).read_text())\n"
+                "assert cfg['dry_run'] is True\n"
+                "assert cfg['exchange']['key'] == ''\n"
+                "assert cfg['exchange']['secret'] == ''\n"
+                "print(f'mock freqtrade {cmd} ok')\n",
+                encoding="utf-8",
+            )
+            os.chmod(ft_bin, 0o755)
+
+            ft_out = vm_worker.process_freqtrade_backtest(
+                {
+                    "repo_url": "https://github.com/example-org/sample-strategy",
+                    "strategy": "SampleStrategy",
+                    "mode": "hyperopt",
+                    "timerange": "20250101-20250201",
+                    "epochs": 5,
+                },
+                token="tok-dummy-0123456789abcdef",
+                clean_env=vm_worker.build_clean_env(),
+                clone_fn=cloner,
+                freqtrade_bin_override=str(ft_bin),
+            )
+            self.assertTrue(ft_out["passed"])
+            self.assertEqual(len(ft_out["steps"]), 2)
+            self.assertIn("hyperopt", ft_out["summary"])
+
+            # Mock omp executable testing isolated models.yml, secret redaction, and --resume wrap-up
+            omp_bin = root / "mock_omp.py"
+            omp_bin.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "from pathlib import Path\n"
+                "agent_dir = Path(os.environ['PI_CODING_AGENT_DIR'])\n"
+                "models_file = agent_dir / 'models.yml'\n"
+                "assert (models_file.stat().st_mode & 0o777) == 0o600\n"
+                "assert 'VM_QUEUE_WORKER_TOKEN' not in os.environ\n"
+                "assert 'VM_QUEUE_LLM_API_KEY' not in os.environ\n"
+                "sdir_idx = sys.argv.index('--session-dir') + 1\n"
+                "sdir = Path(sys.argv[sdir_idx])\n"
+                "report = Path(os.getcwd()) / 'report.md'\n"
+                "if '--resume' in sys.argv:\n"
+                "    report.write_text('# QA 01\\n## 판정: 지적 있음\\n### [지적] leak local-llm-secret-12345\\n', encoding='utf-8')\n"
+                "    print('wrap ok local-llm-secret-12345')\n"
+                "else:\n"
+                "    (sdir / 'run1.jsonl').write_text('{}\\n', encoding='utf-8')\n"
+                "    report.write_text('# QA 01\\npartial only\\n', encoding='utf-8')\n"
+                "    print('phase1 incomplete')\n",
+                encoding="utf-8",
+            )
+            os.chmod(omp_bin, 0o755)
+
+            qa_out = vm_worker.process_qa_scenario(
+                {
+                    "repo_url": "https://github.com/example-org/sample-repo",
+                    "scenario_id": "01",
+                    "scenario_name": "config test",
+                    "brief": "Brief",
+                    "task": "Task",
+                    "model": "deepseek-v4.1-flash:max",
+                    "phase1_sec": 60,
+                    "wrap_sec": 30,
+                },
+                token="tok-dummy-0123456789abcdef",
+                clean_env=vm_worker.build_clean_env(),
+                clone_fn=cloner,
+                omp_bin_override=str(omp_bin),
+                llm_env={
+                    "VM_QUEUE_LLM_API_KEY": "local-llm-secret-12345",
+                    "VM_QUEUE_LLM_BASE_URL": "https://llm.example.com/v1",
+                    "VM_QUEUE_LLM_PROVIDER": "custom",
+                },
+            )
+            self.assertTrue(qa_out["passed"])
+            self.assertEqual(qa_out["verdict"], "지적 있음")
+            self.assertEqual(qa_out["findings_count"], 1)
+            self.assertEqual(len(qa_out["steps"]), 2)
+            self.assertIn("[REDACTED]", qa_out["report_md"])
+            self.assertNotIn("local-llm-secret-12345", json.dumps(qa_out))
 
 
 class VmWorkerIntegrationTest(unittest.TestCase):
@@ -377,6 +617,42 @@ class VmWorkerIntegrationTest(unittest.TestCase):
         self.assertEqual(workers_status["workers"][0]["worker_id"], "cue-int-1")
         self.assertTrue(workers_status["workers"][0]["arch"])
         self.assertGreaterEqual(workers_status["workers"][0]["cpus"], 1)
+
+    def test_kinds_filtering_and_concurrency(self) -> None:
+        self._admin_req(
+            "/jobs",
+            {
+                "job_id": "int-ft-skip-1",
+                "kind": "freqtrade_backtest",
+                "input": {
+                    "repo_url": "https://github.com/example-org/sample-strategy",
+                    "strategy": "SampleStrategy",
+                    "timerange": "20250101-20250201",
+                },
+            },
+        )
+        for idx in (1, 2, 3):
+            self._admin_req(
+                "/jobs",
+                {"job_id": f"int-conc-probe-{idx}", "kind": "probe", "input": {"idx": idx}},
+            )
+
+        res = vm_worker.run_worker(
+            base_url=self.base_url,
+            token=self.worker_token,
+            worker_id="cue-conc",
+            lease_sec=60,
+            mode="drain",
+            poll_sec=1,
+            max_idle_sec=5,
+            kinds=["probe"],
+            concurrency=2,
+        )
+        self.assertEqual(len(res), 3)
+        self.assertTrue(all(r["status"] == "completed" for r in res))
+        # freqtrade job remains queued because worker only claimed probe
+        ft_job = self._admin_req("/jobs/int-ft-skip-1")
+        self.assertEqual(ft_job["status"], "queued")
 
 
 if __name__ == "__main__":

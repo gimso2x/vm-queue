@@ -33,15 +33,64 @@ export interface VmQueueApp {
   close: () => void;
 }
 
-export const ALLOWED_KINDS = new Set(["probe", "repo_check"]);
+export const ALLOWED_KINDS = new Set([
+  "probe",
+  "repo_check",
+  "freqtrade_backtest",
+  "qa_scenario",
+]);
 export const ALLOWED_REPO_CHECK_PRESETS = new Set([
   "auto",
   "git_info",
   "bun_test",
   "bun_check",
+  "bun_build",
+  "npm_test",
+  "playwright_test",
+  "repo_index",
   "pytest",
   "go_test",
   "cargo_test",
+]);
+export const ALLOWED_FREQTRADE_MODES = new Set(["backtest", "hyperopt"]);
+export const ALLOWED_FREQTRADE_EXCHANGES = new Set([
+  "binance",
+  "okx",
+  "bybit",
+  "gate",
+  "kraken",
+]);
+export const ALLOWED_FREQTRADE_TIMEFRAMES = new Set([
+  "1m",
+  "5m",
+  "15m",
+  "30m",
+  "1h",
+  "4h",
+  "1d",
+]);
+export const ALLOWED_HYPEROPT_SPACES = new Set([
+  "buy",
+  "sell",
+  "roi",
+  "stoploss",
+  "trailing",
+]);
+export const ALLOWED_HYPEROPT_LOSSES = new Set([
+  "ShortTradeDurHyperOptLoss",
+  "OnlyProfitHyperOptLoss",
+  "SharpeHyperOptLoss",
+  "SortinoHyperOptLoss",
+  "CalmarHyperOptLoss",
+]);
+export const ALLOWED_QA_TOOLS = new Set([
+  "read",
+  "bash",
+  "edit",
+  "write",
+  "grep",
+  "glob",
+  "todo",
 ]);
 export const DEFAULT_MAX_INPUT_BYTES = 5 * 1024 * 1024;
 export const HARD_MAX_INPUT_BYTES = 5 * 1024 * 1024;
@@ -63,9 +112,44 @@ const ALLOWED_REPO_CHECK_KEYS = new Set([
   "ref",
   "timeout_sec",
 ]);
+const ALLOWED_FREQTRADE_KEYS = new Set([
+  "repo_url",
+  "ref",
+  "strategy",
+  "mode",
+  "exchange",
+  "timeframe",
+  "timerange",
+  "pairs",
+  "epochs",
+  "spaces",
+  "hyperopt_loss",
+  "stake_amount",
+  "max_open_trades",
+  "timeout_sec",
+]);
+const ALLOWED_QA_SCENARIO_KEYS = new Set([
+  "repo_url",
+  "ref",
+  "scenario_id",
+  "scenario_name",
+  "brief",
+  "task",
+  "lessons",
+  "model",
+  "phase1_sec",
+  "wrap_sec",
+  "tools",
+]);
 const GITHUB_PUBLIC_REPO_RE =
   /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/;
 const GIT_REF_RE = /^[A-Za-z0-9._\/-]{1,128}$/;
+const STRATEGY_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+const TIMERANGE_RE = /^(\d{8})-(\d{8})$/;
+const PAIR_RE = /^[A-Z0-9]{2,12}\/[A-Z]{3,6}(?::[A-Z]{3,6})?$/;
+const SCENARIO_ID_RE = /^[A-Za-z0-9._-]{1,32}$/;
+const QA_MODEL_RE = /^[A-Za-z0-9._:\/-]{1,96}$/;
+const PAID_MODEL_RE = /anthropic|claude|openai|gpt-4|gpt-5|\bo1\b|\bo3\b/i;
 
 const SECURITY_HEADERS: Record<string, string> = {
   "X-Content-Type-Options": "nosniff",
@@ -211,14 +295,157 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function validateStrictInputKeys(
+  inputValue: Record<string, unknown>,
+  allowedKeys: ReadonlySet<string>,
+  errCode: string,
+): { ok: true } | { ok: false; error: string; detail: string } {
+  for (const key of Object.keys(inputValue)) {
+    if (!allowedKeys.has(key)) {
+      return {
+        ok: false,
+        error: errCode,
+        detail: `unsupported field: ${key}`,
+      };
+    }
+  }
+  return { ok: true };
+}
+
+function validateGitHubRepoUrl(
+  repoUrl: unknown,
+  errCode: string,
+): { ok: true } | { ok: false; error: string; detail: string } {
+  if (typeof repoUrl !== "string") {
+    return { ok: false, error: errCode, detail: "repo_url must be a string" };
+  }
+  const repoMatch = GITHUB_PUBLIC_REPO_RE.exec(repoUrl);
+  if (!repoMatch) {
+    return {
+      ok: false,
+      error: errCode,
+      detail: "repo_url must be https://github.com/<owner>/<repo>",
+    };
+  }
+  const [, owner, repo] = repoMatch;
+  if (
+    owner === "." ||
+    owner === ".." ||
+    repo === "." ||
+    repo === ".." ||
+    owner.includes("..") ||
+    repo.includes("..") ||
+    owner.startsWith("-") ||
+    repo.startsWith("-")
+  ) {
+    return {
+      ok: false,
+      error: errCode,
+      detail: "invalid owner or repository name",
+    };
+  }
+  return { ok: true };
+}
+
+function validateGitRef(
+  ref: unknown,
+  errCode: string,
+): { ok: true } | { ok: false; error: string; detail: string } {
+  if (ref === undefined) return { ok: true };
+  if (
+    typeof ref !== "string" ||
+    !GIT_REF_RE.test(ref) ||
+    ref.startsWith("-") ||
+    ref.startsWith("/") ||
+    ref.endsWith("/") ||
+    ref.includes("..") ||
+    ref.includes("//")
+  ) {
+    return { ok: false, error: errCode, detail: "invalid git ref" };
+  }
+  return { ok: true };
+}
+
+function validateIntRange(
+  value: unknown,
+  errCode: string,
+  field: string,
+  min: number,
+  max: number,
+): { ok: true } | { ok: false; error: string; detail: string } {
+  if (value === undefined) return { ok: true };
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < min ||
+    value > max
+  ) {
+    return {
+      ok: false,
+      error: errCode,
+      detail: `${field} must be an integer between ${min} and ${max}`,
+    };
+  }
+  return { ok: true };
+}
+
+function validateStringArrayField(
+  value: unknown,
+  errCode: string,
+  field: string,
+  minLen: number,
+  maxLen: number,
+  itemValid: (item: string) => boolean,
+): { ok: true } | { ok: false; error: string; detail: string } {
+  if (value === undefined) return { ok: true };
+  if (!Array.isArray(value) || value.length < minLen || value.length > maxLen) {
+    return {
+      ok: false,
+      error: errCode,
+      detail: `${field} must be an array of ${minLen}..${maxLen} items`,
+    };
+  }
+  for (const item of value) {
+    if (typeof item !== "string" || !itemValid(item)) {
+      return {
+        ok: false,
+        error: errCode,
+        detail: `invalid item in ${field}`,
+      };
+    }
+  }
+  return { ok: true };
+}
+
+function isValidTimerange(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const match = TIMERANGE_RE.exec(value);
+  if (!match) return false;
+  const [, startStr, endStr] = match;
+  if (startStr >= endStr) return false;
+  for (const d of [startStr, endStr]) {
+    const month = Number(d.slice(4, 6));
+    const day = Number(d.slice(6, 8));
+    if (month < 1 || month > 12 || day < 1 || day > 31) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function validateJobInput(
   kind: string,
   inputValue: unknown,
 ): { ok: true } | { ok: false; error: string; detail?: string } {
   if (!isPlainObject(inputValue)) {
+    const errMap: Record<string, string> = {
+      repo_check: "invalid_repo_check_input",
+      freqtrade_backtest: "invalid_freqtrade_backtest_input",
+      qa_scenario: "invalid_qa_scenario_input",
+    };
     return {
       ok: false,
-      error: kind === "repo_check" ? "invalid_repo_check_input" : "invalid_input",
+      error: errMap[kind] ?? "invalid_input",
       detail: "input must be a JSON object",
     };
   }
@@ -226,89 +453,188 @@ export function validateJobInput(
     return { ok: true };
   }
   if (kind === "repo_check") {
-    for (const key of Object.keys(inputValue)) {
-      if (!ALLOWED_REPO_CHECK_KEYS.has(key)) {
-        return {
-          ok: false,
-          error: "invalid_repo_check_input",
-          detail: `unsupported field: ${key}`,
-        };
-      }
-    }
-    const repoUrl = inputValue.repo_url;
-    if (typeof repoUrl !== "string") {
-      return {
-        ok: false,
-        error: "invalid_repo_check_input",
-        detail: "repo_url must be a string",
-      };
-    }
-    const repoMatch = GITHUB_PUBLIC_REPO_RE.exec(repoUrl);
-    if (!repoMatch) {
-      return {
-        ok: false,
-        error: "invalid_repo_check_input",
-        detail: "repo_url must be https://github.com/<owner>/<repo>",
-      };
-    }
-    const [, owner, repo] = repoMatch;
-    if (
-      owner === "." ||
-      owner === ".." ||
-      repo === "." ||
-      repo === ".." ||
-      owner.includes("..") ||
-      repo.includes("..") ||
-      owner.startsWith("-") ||
-      repo.startsWith("-")
-    ) {
-      return {
-        ok: false,
-        error: "invalid_repo_check_input",
-        detail: "invalid owner or repository name",
-      };
-    }
+    const errCode = "invalid_repo_check_input";
+    const keyCheck = validateStrictInputKeys(inputValue, ALLOWED_REPO_CHECK_KEYS, errCode);
+    if (!keyCheck.ok) return keyCheck;
+    const repoCheck = validateGitHubRepoUrl(inputValue.repo_url, errCode);
+    if (!repoCheck.ok) return repoCheck;
+
     const preset = inputValue.preset;
     if (
       preset !== undefined &&
       (typeof preset !== "string" || !ALLOWED_REPO_CHECK_PRESETS.has(preset))
     ) {
+      return { ok: false, error: errCode, detail: "unsupported preset" };
+    }
+    const refCheck = validateGitRef(inputValue.ref, errCode);
+    if (!refCheck.ok) return refCheck;
+    return validateIntRange(inputValue.timeout_sec, errCode, "timeout_sec", 10, 1800);
+  }
+  if (kind === "freqtrade_backtest") {
+    const errCode = "invalid_freqtrade_backtest_input";
+    const keyCheck = validateStrictInputKeys(inputValue, ALLOWED_FREQTRADE_KEYS, errCode);
+    if (!keyCheck.ok) return keyCheck;
+    const repoCheck = validateGitHubRepoUrl(inputValue.repo_url, errCode);
+    if (!repoCheck.ok) return repoCheck;
+    const refCheck = validateGitRef(inputValue.ref, errCode);
+    if (!refCheck.ok) return refCheck;
+
+    if (
+      typeof inputValue.strategy !== "string" ||
+      !STRATEGY_NAME_RE.test(inputValue.strategy)
+    ) {
+      return { ok: false, error: errCode, detail: "invalid strategy name" };
+    }
+    if (
+      inputValue.mode !== undefined &&
+      (typeof inputValue.mode !== "string" ||
+        !ALLOWED_FREQTRADE_MODES.has(inputValue.mode))
+    ) {
+      return { ok: false, error: errCode, detail: "unsupported mode" };
+    }
+    if (
+      inputValue.exchange !== undefined &&
+      (typeof inputValue.exchange !== "string" ||
+        !ALLOWED_FREQTRADE_EXCHANGES.has(inputValue.exchange))
+    ) {
+      return { ok: false, error: errCode, detail: "unsupported exchange" };
+    }
+    if (
+      inputValue.timeframe !== undefined &&
+      (typeof inputValue.timeframe !== "string" ||
+        !ALLOWED_FREQTRADE_TIMEFRAMES.has(inputValue.timeframe))
+    ) {
+      return { ok: false, error: errCode, detail: "unsupported timeframe" };
+    }
+    if (!isValidTimerange(inputValue.timerange)) {
       return {
         ok: false,
-        error: "invalid_repo_check_input",
-        detail: "unsupported preset",
+        error: errCode,
+        detail: "timerange must be YYYYMMDD-YYYYMMDD with start < end",
       };
     }
-    if (inputValue.ref !== undefined) {
-      const ref = inputValue.ref;
+    const pairsCheck = validateStringArrayField(
+      inputValue.pairs,
+      errCode,
+      "pairs",
+      1,
+      20,
+      (p) => PAIR_RE.test(p),
+    );
+    if (!pairsCheck.ok) return pairsCheck;
+    const epochsCheck = validateIntRange(inputValue.epochs, errCode, "epochs", 1, 200);
+    if (!epochsCheck.ok) return epochsCheck;
+    const spacesCheck = validateStringArrayField(
+      inputValue.spaces,
+      errCode,
+      "spaces",
+      1,
+      4,
+      (s) => ALLOWED_HYPEROPT_SPACES.has(s),
+    );
+    if (!spacesCheck.ok) return spacesCheck;
+    if (
+      inputValue.hyperopt_loss !== undefined &&
+      (typeof inputValue.hyperopt_loss !== "string" ||
+        !ALLOWED_HYPEROPT_LOSSES.has(inputValue.hyperopt_loss))
+    ) {
+      return { ok: false, error: errCode, detail: "unsupported hyperopt_loss" };
+    }
+    if (
+      inputValue.stake_amount !== undefined &&
+      (typeof inputValue.stake_amount !== "number" ||
+        !Number.isFinite(inputValue.stake_amount) ||
+        inputValue.stake_amount < 10 ||
+        inputValue.stake_amount > 100000)
+    ) {
+      return {
+        ok: false,
+        error: errCode,
+        detail: "stake_amount must be a number between 10 and 100000",
+      };
+    }
+    const tradesCheck = validateIntRange(
+      inputValue.max_open_trades,
+      errCode,
+      "max_open_trades",
+      1,
+      20,
+    );
+    if (!tradesCheck.ok) return tradesCheck;
+    return validateIntRange(inputValue.timeout_sec, errCode, "timeout_sec", 60, 3600);
+  }
+  if (kind === "qa_scenario") {
+    const errCode = "invalid_qa_scenario_input";
+    const keyCheck = validateStrictInputKeys(inputValue, ALLOWED_QA_SCENARIO_KEYS, errCode);
+    if (!keyCheck.ok) return keyCheck;
+    const repoCheck = validateGitHubRepoUrl(inputValue.repo_url, errCode);
+    if (!repoCheck.ok) return repoCheck;
+    const refCheck = validateGitRef(inputValue.ref, errCode);
+    if (!refCheck.ok) return refCheck;
+
+    if (
+      typeof inputValue.scenario_id !== "string" ||
+      !SCENARIO_ID_RE.test(inputValue.scenario_id)
+    ) {
+      return { ok: false, error: errCode, detail: "invalid scenario_id" };
+    }
+    if (
+      typeof inputValue.scenario_name !== "string" ||
+      inputValue.scenario_name.trim().length < 1 ||
+      inputValue.scenario_name.length > 160
+    ) {
+      return { ok: false, error: errCode, detail: "invalid scenario_name" };
+    }
+    if (
+      typeof inputValue.brief !== "string" ||
+      inputValue.brief.trim().length < 1 ||
+      inputValue.brief.length > 65536
+    ) {
+      return { ok: false, error: errCode, detail: "invalid brief" };
+    }
+    if (
+      typeof inputValue.task !== "string" ||
+      inputValue.task.trim().length < 1 ||
+      inputValue.task.length > 32768
+    ) {
+      return { ok: false, error: errCode, detail: "invalid task" };
+    }
+    if (
+      inputValue.lessons !== undefined &&
+      (typeof inputValue.lessons !== "string" || inputValue.lessons.length > 65536)
+    ) {
+      return { ok: false, error: errCode, detail: "invalid lessons" };
+    }
+    if (inputValue.model !== undefined) {
       if (
-        typeof ref !== "string" ||
-        !GIT_REF_RE.test(ref) ||
-        ref.startsWith("-") ||
-        ref.startsWith("/") ||
-        ref.endsWith("/") ||
-        ref.includes("..") ||
-        ref.includes("//")
+        typeof inputValue.model !== "string" ||
+        !QA_MODEL_RE.test(inputValue.model) ||
+        PAID_MODEL_RE.test(inputValue.model)
       ) {
-        return {
-          ok: false,
-          error: "invalid_repo_check_input",
-          detail: "invalid git ref",
-        };
+        return { ok: false, error: errCode, detail: "invalid or disallowed paid model" };
       }
     }
-    if (inputValue.timeout_sec !== undefined) {
+    const phase1Check = validateIntRange(
+      inputValue.phase1_sec,
+      errCode,
+      "phase1_sec",
+      30,
+      3600,
+    );
+    if (!phase1Check.ok) return phase1Check;
+    const wrapCheck = validateIntRange(inputValue.wrap_sec, errCode, "wrap_sec", 0, 900);
+    if (!wrapCheck.ok) return wrapCheck;
+    if (inputValue.tools !== undefined) {
+      if (typeof inputValue.tools !== "string") {
+        return { ok: false, error: errCode, detail: "tools must be a string" };
+      }
+      const parts = inputValue.tools.split(",").map((s) => s.trim());
       if (
-        typeof inputValue.timeout_sec !== "number" ||
-        !Number.isInteger(inputValue.timeout_sec) ||
-        inputValue.timeout_sec < 10 ||
-        inputValue.timeout_sec > 600
+        parts.length < 1 ||
+        parts.length > 7 ||
+        parts.some((p) => !p || !ALLOWED_QA_TOOLS.has(p))
       ) {
-        return {
-          ok: false,
-          error: "invalid_repo_check_input",
-          detail: "timeout_sec must be an integer between 10 and 600",
-        };
+        return { ok: false, error: errCode, detail: "unsupported tools list" };
       }
     }
     return { ok: true };
@@ -642,12 +968,20 @@ export function createVmQueueApp(options: VmQueueOptions): VmQueueApp {
       );
     }
 
-    const inputValue =
-      kind === "repo_check" &&
-      isPlainObject(rawInputValue) &&
-      rawInputValue.preset === undefined
-        ? { ...rawInputValue, preset: "auto" }
-        : rawInputValue;
+    let inputValue: unknown = rawInputValue;
+    if (kind === "repo_check" && isPlainObject(rawInputValue)) {
+      inputValue =
+        rawInputValue.preset === undefined
+          ? { ...rawInputValue, preset: "auto" }
+          : rawInputValue;
+    } else if (kind === "freqtrade_backtest" && isPlainObject(rawInputValue)) {
+      inputValue = {
+        ...rawInputValue,
+        mode: rawInputValue.mode ?? "backtest",
+        exchange: rawInputValue.exchange ?? "binance",
+        timeframe: rawInputValue.timeframe ?? "5m",
+      };
+    }
 
     const inputBuf = Buffer.from(JSON.stringify(inputValue), "utf8");
     if (inputBuf.byteLength > maxInputBytes) {
@@ -658,6 +992,17 @@ export function createVmQueueApp(options: VmQueueOptions): VmQueueApp {
           actual_bytes: inputBuf.byteLength,
         },
         413,
+      );
+    }
+
+    const inputSecretRule = detectSecretPattern(
+      inputBuf.toString("utf8"),
+      configuredTokens,
+    );
+    if (inputSecretRule !== null) {
+      return jsonResponse(
+        { error: "secret_pattern_detected", rule: inputSecretRule },
+        422,
       );
     }
 
@@ -745,27 +1090,61 @@ export function createVmQueueApp(options: VmQueueOptions): VmQueueApp {
       return jsonResponse({ error: "invalid_lease_sec" }, 400);
     }
 
+    let claimKinds: string[] | null = null;
+    if (payload.kinds !== undefined) {
+      if (
+        !Array.isArray(payload.kinds) ||
+        payload.kinds.length === 0 ||
+        payload.kinds.length > ALLOWED_KINDS.size
+      ) {
+        return jsonResponse({ error: "invalid_kinds" }, 400);
+      }
+      const uniqueKinds: string[] = [];
+      for (const item of payload.kinds) {
+        if (typeof item !== "string" || !ALLOWED_KINDS.has(item)) {
+          return jsonResponse({ error: "invalid_kinds" }, 400);
+        }
+        if (!uniqueKinds.includes(item)) {
+          uniqueKinds.push(item);
+        }
+      }
+      claimKinds = uniqueKinds;
+    }
+
     const meta = parseWorkerMeta(payload.meta);
     const nowMs = now();
     const claimed = withImmediateTx(db, () => {
       sweepExpiredAndLeased(db, nowMs);
-      const next = db
-        .query(
-          `SELECT job_id, kind, max_input_bytes, max_output_bytes, expires_at, attempts
-           FROM jobs
-           WHERE status = 'queued'
-           ORDER BY created_at ASC, rowid ASC
-           LIMIT 1`,
-        )
-        .get() as Pick<
-          JobRow,
-          | "job_id"
-          | "kind"
-          | "max_input_bytes"
-          | "max_output_bytes"
-          | "expires_at"
-          | "attempts"
-        > | null;
+      const next = (
+        claimKinds === null
+          ? db
+              .query(
+                `SELECT job_id, kind, max_input_bytes, max_output_bytes, expires_at, attempts
+                 FROM jobs
+                 WHERE status = 'queued'
+                 ORDER BY created_at ASC, rowid ASC
+                 LIMIT 1`,
+              )
+              .get()
+          : db
+              .query(
+                `SELECT job_id, kind, max_input_bytes, max_output_bytes, expires_at, attempts
+                 FROM jobs
+                 WHERE status = 'queued'
+                   AND kind IN (${claimKinds.map(() => "?").join(", ")})
+                 ORDER BY created_at ASC, rowid ASC
+                 LIMIT 1`,
+              )
+              .get(...claimKinds)
+      ) as Pick<
+        JobRow,
+        | "job_id"
+        | "kind"
+        | "max_input_bytes"
+        | "max_output_bytes"
+        | "expires_at"
+        | "attempts"
+      > | null;
 
       if (!next) {
         touchWorker(db, workerId, nowMs, "claim_empty", null, meta);

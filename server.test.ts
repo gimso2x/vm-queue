@@ -1050,4 +1050,316 @@ describe("vm-queue server", () => {
     expect(statusOffline.workers[0].online).toBe(false);
     expect(statusOffline.workers[0].idle_sec).toBe(70);
   });
+
+  test("17. Accepts extended repo_check presets and timeout_sec up to 1800", async () => {
+    const { baseUrl } = startTestApp();
+
+    for (const preset of ["bun_build", "npm_test", "playwright_test", "repo_index"]) {
+      const okRes = await fetch(`${baseUrl}/jobs`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${ADMIN_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          kind: "repo_check",
+          input: {
+            repo_url: "https://github.com/example-org/sample-repo",
+            preset,
+            timeout_sec: 1800,
+          },
+        }),
+      });
+      expect(okRes.status).toBe(201);
+    }
+
+    const tooLong = await fetch(`${baseUrl}/jobs`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ADMIN_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        kind: "repo_check",
+        input: {
+          repo_url: "https://github.com/example-org/sample-repo",
+          preset: "bun_build",
+          timeout_sec: 1801,
+        },
+      }),
+    });
+    expect(tooLong.status).toBe(400);
+    expect((await tooLong.json()).error).toBe("invalid_repo_check_input");
+  });
+
+  test("18. Validates freqtrade_backtest input and normalizes defaults", async () => {
+    const { baseUrl } = startTestApp();
+
+    const okRes = await fetch(`${baseUrl}/jobs`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ADMIN_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        job_id: "ft-valid-1",
+        kind: "freqtrade_backtest",
+        input: {
+          repo_url: "https://github.com/example-org/sample-strategy",
+          strategy: "SampleStrategy_v1",
+          timerange: "20250101-20250201",
+          pairs: ["BTC/USDT", "ETH/USDT:USDT"],
+          epochs: 20,
+          spaces: ["buy", "sell"],
+          hyperopt_loss: "SharpeHyperOptLoss",
+          stake_amount: 100,
+          max_open_trades: 3,
+          timeout_sec: 900,
+        },
+      }),
+    });
+    expect(okRes.status).toBe(201);
+
+    const claimRes = await fetch(`${baseUrl}/jobs/claim`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WORKER_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ worker_id: "ft-w1" }),
+    });
+    const claimBody = (await claimRes.json()) as {
+      job: { job_id: string; lease_token: string };
+    };
+    const inputRes = await fetch(`${baseUrl}/jobs/${claimBody.job.job_id}/input`, {
+      headers: {
+        Authorization: `Bearer ${WORKER_TOKEN}`,
+        "X-Worker-Id": "ft-w1",
+        "X-Lease-Token": claimBody.job.lease_token,
+      },
+    });
+    const storedInput = (await inputRes.json()) as Record<string, unknown>;
+    expect(storedInput.mode).toBe("backtest");
+    expect(storedInput.exchange).toBe("binance");
+    expect(storedInput.timeframe).toBe("5m");
+
+    const badCases: Array<Record<string, unknown>> = [
+      {
+        repo_url: "https://gitlab.com/org/repo",
+        strategy: "SampleStrategy",
+        timerange: "20250101-20250201",
+      },
+      {
+        repo_url: "https://github.com/org/repo",
+        strategy: "1BadStart",
+        timerange: "20250101-20250201",
+      },
+      {
+        repo_url: "https://github.com/org/repo",
+        strategy: "SampleStrategy",
+        timerange: "20250201-20250101",
+      },
+      {
+        repo_url: "https://github.com/org/repo",
+        strategy: "SampleStrategy",
+        timerange: "20251301-20251310",
+      },
+      {
+        repo_url: "https://github.com/org/repo",
+        strategy: "SampleStrategy",
+        timerange: "20250101-20250201",
+        pairs: ["invalid-pair"],
+      },
+      {
+        repo_url: "https://github.com/org/repo",
+        strategy: "SampleStrategy",
+        timerange: "20250101-20250201",
+        cmd: "id",
+      },
+    ];
+
+    for (const bad of badCases) {
+      const res = await fetch(`${baseUrl}/jobs`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${ADMIN_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ kind: "freqtrade_backtest", input: bad }),
+      });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe("invalid_freqtrade_backtest_input");
+    }
+  });
+
+  test("19. Validates qa_scenario input and blocks paid models and task tool", async () => {
+    const { baseUrl } = startTestApp();
+
+    const okRes = await fetch(`${baseUrl}/jobs`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ADMIN_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        job_id: "qa-valid-1",
+        kind: "qa_scenario",
+        input: {
+          repo_url: "https://github.com/example-org/sample-repo",
+          scenario_id: "01",
+          scenario_name: "config validation",
+          brief: "# QA Brief",
+          task: "Check config parser",
+          model: "deepseek-v4.1-flash:max",
+          phase1_sec: 1200,
+          wrap_sec: 300,
+          tools: "read,bash,grep",
+        },
+      }),
+    });
+    expect(okRes.status).toBe(201);
+
+    const badCases: Array<Record<string, unknown>> = [
+      {
+        repo_url: "https://github.com/example-org/sample-repo",
+        scenario_id: "01",
+        scenario_name: "paid claude",
+        brief: "brief",
+        task: "task",
+        model: "anthropic/claude-sonnet-4-5",
+      },
+      {
+        repo_url: "https://github.com/example-org/sample-repo",
+        scenario_id: "01",
+        scenario_name: "paid gpt",
+        brief: "brief",
+        task: "task",
+        model: "openai/gpt-5",
+      },
+      {
+        repo_url: "https://github.com/example-org/sample-repo",
+        scenario_id: "01",
+        scenario_name: "task tool",
+        brief: "brief",
+        task: "task",
+        tools: "read,task",
+      },
+      {
+        repo_url: "https://github.com/example-org/sample-repo",
+        scenario_id: "01",
+        scenario_name: "empty brief",
+        brief: "   ",
+        task: "task",
+      },
+    ];
+
+    for (const bad of badCases) {
+      const res = await fetch(`${baseUrl}/jobs`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${ADMIN_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ kind: "qa_scenario", input: bad }),
+      });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe("invalid_qa_scenario_input");
+    }
+  });
+
+  test("20. Rejects POST /jobs input containing secret patterns with 422", async () => {
+    const { baseUrl } = startTestApp();
+
+    const secretInput = await fetch(`${baseUrl}/jobs`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ADMIN_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        kind: "qa_scenario",
+        input: {
+          repo_url: "https://github.com/example-org/sample-repo",
+          scenario_id: "02",
+          scenario_name: "secret leak check",
+          brief: "Use sk-" + "proj-0123456789abcdef in test",
+          task: "Check config",
+        },
+      }),
+    });
+    expect(secretInput.status).toBe(422);
+    expect((await secretInput.json()).error).toBe("secret_pattern_detected");
+  });
+
+  test("21. POST /jobs/claim filters by kinds and rejects invalid kinds", async () => {
+    const { baseUrl } = startTestApp();
+
+    const badKinds = await fetch(`${baseUrl}/jobs/claim`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WORKER_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ worker_id: "w-filter", kinds: ["unknown_kind"] }),
+    });
+    expect(badKinds.status).toBe(400);
+    expect((await badKinds.json()).error).toBe("invalid_kinds");
+
+    const emptyKinds = await fetch(`${baseUrl}/jobs/claim`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WORKER_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ worker_id: "w-filter", kinds: [] }),
+    });
+    expect(emptyKinds.status).toBe(400);
+
+    await fetch(`${baseUrl}/jobs`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ADMIN_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        job_id: "ft-first-1",
+        kind: "freqtrade_backtest",
+        input: {
+          repo_url: "https://github.com/example-org/sample-strategy",
+          strategy: "SampleStrategy",
+          timerange: "20250101-20250201",
+        },
+      }),
+    });
+
+    await fetch(`${baseUrl}/jobs`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ADMIN_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        job_id: "probe-second-1",
+        kind: "probe",
+      }),
+    });
+
+    const filteredClaim = await fetch(`${baseUrl}/jobs/claim`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WORKER_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        worker_id: "w-filter",
+        kinds: ["probe", "repo_check"],
+      }),
+    });
+    expect(filteredClaim.status).toBe(200);
+    const body = (await filteredClaim.json()) as {
+      job: { job_id: string; kind: string } | null;
+    };
+    expect(body.job?.job_id).toBe("probe-second-1");
+    expect(body.job?.kind).toBe("probe");
+  });
 });
