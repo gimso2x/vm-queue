@@ -102,20 +102,26 @@ tailscale serve status
 ssh your-server "sed -n 's/^VM_QUEUE_WORKER_TOKEN=//p' ~/services/vm-queue/.env"
 ```
 
-### 4.2 상시 서버에서 작업 투입
+### 4.2 상시 서버에서 작업 투입 및 자동 오프로드
 
 ```bash
+# 워커 생존 여부(최근 90초)를 먼저 확인한 뒤 자동 오프로드
+bun run cli/vm-queue-cli.ts workers --window 90
+bun run cli/vm-queue-cli.ts offload \
+  --repo https://github.com/example-org/sample-repo \
+  --ref main
+
+# 직접 등록할 때도 --preset 을 생략하면 auto 로 동작합니다
 bun run cli/vm-queue-cli.ts submit-repo-check \
   --job-id check-demo-1 \
-  --repo https://github.com/example-org/sample-repo \
-  --preset bun_test \
-  --ref main
+  --repo https://github.com/example-org/sample-repo
 ```
 
 허용 프리셋 목록은 다음과 같습니다.
 
 | 프리셋 | 실행 내용 | 비고 |
 |---|---|---|
+| `auto` (기본값) | 저장소 매니페스트(`package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`)와 설치된 도구를 보고 자동 선택 | 해당 런타임이 없으면 `git_info`로 안전 폴백 |
 | `git_info` | 추적 파일 수, 확장자 분포, 매니페스트 존재 여부 수집 | 저장소 코드를 실행하지 않음 |
 | `bun_test` | `bun install --ignore-scripts` 후 `bun test` | `bun` 필요 |
 | `bun_check` | `bun install --ignore-scripts` 후 `bun run check` | `bun` 필요 |
@@ -123,12 +129,14 @@ bun run cli/vm-queue-cli.ts submit-repo-check \
 | `go_test` | `go test ./...` | `go` 필요 |
 | `cargo_test` | `cargo test` | `cargo` 필요 |
 
-### 4.3 일회성 AI VM에서 작업 비우기
+### 4.3 일회성 AI VM에서 작업 비우기 (유한 세션 폴링)
 
-워커 VM에 `VM_QUEUE_WORKER_TOKEN` 환경변수를 넣은 뒤 원라인 명령을 실행합니다. 명령은 `--mode drain` 기본값으로 동작해 대기 작업을 모두 처리하면 종료합니다.
+워커 VM에 `VM_QUEUE_WORKER_TOKEN` 환경변수를 넣은 뒤 원라인 명령을 실행합니다. 기본 `--mode drain`은 대기 작업을 처리하고 바로 종료하며 작업 시간 동안 자동으로 새 작업을 받으려면 `--mode poll --max-idle-sec 1800`(30분 유휴 시 자동 종료, 최대 허용치 3600초)을 사용합니다.
+
+> 무료 AI VM 계정 정지 위험을 피하려고 24시간 휴면 방지나 클릭 유지 루프는 의도적으로 제외했습니다.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/gimso2x/vm-queue/main/worker/vm_worker.py -o /tmp/vm_worker.py && python3 /tmp/vm_worker.py --url http://100.64.0.10:8790
+curl -fsSL https://raw.githubusercontent.com/gimso2x/vm-queue/main/worker/vm_worker.py -o /tmp/vm_worker.py && python3 /tmp/vm_worker.py --url http://100.64.0.10:8790 --mode poll --max-idle-sec 1800
 ```
 
 실패하거나 리스가 꼬인 작업은 상시 서버에서 다시 큐로 돌릴 수 있습니다.

@@ -35,6 +35,7 @@ export interface VmQueueApp {
 
 export const ALLOWED_KINDS = new Set(["probe", "repo_check"]);
 export const ALLOWED_REPO_CHECK_PRESETS = new Set([
+  "auto",
   "git_info",
   "bun_test",
   "bun_check",
@@ -50,9 +51,12 @@ export const DEFAULT_TTL_SEC = 3600;
 export const MAX_TTL_SEC = 86400;
 export const DEFAULT_LEASE_SEC = 60;
 export const MAX_LEASE_SEC = 600;
+export const DEFAULT_WORKER_WINDOW_SEC = 90;
+export const MAX_WORKER_WINDOW_SEC = 3600;
 
 const JOB_ID_RE = /^[a-zA-Z0-9_-]{3,64}$/;
 const WORKER_ID_RE = /^[a-zA-Z0-9._:-]{1,64}$/;
+const WORKER_ARCH_RE = /^[a-zA-Z0-9._-]{1,32}$/;
 const ALLOWED_REPO_CHECK_KEYS = new Set([
   "repo_url",
   "preset",
@@ -100,6 +104,15 @@ interface JobRow {
   output_json: string | null;
   error_text: string | null;
   completed_at: number | null;
+}
+
+interface WorkerRow {
+  worker_id: string;
+  last_seen_at: number;
+  last_action: string;
+  last_job_id: string | null;
+  arch: string | null;
+  cpus: number | null;
 }
 
 function sha256Digest(value: string): Buffer {
@@ -256,7 +269,10 @@ export function validateJobInput(
       };
     }
     const preset = inputValue.preset;
-    if (typeof preset !== "string" || !ALLOWED_REPO_CHECK_PRESETS.has(preset)) {
+    if (
+      preset !== undefined &&
+      (typeof preset !== "string" || !ALLOWED_REPO_CHECK_PRESETS.has(preset))
+    ) {
       return {
         ok: false,
         error: "invalid_repo_check_input",
@@ -396,6 +412,46 @@ function serializeAdminJob(row: JobRow, includeOutput: boolean): Record<string, 
   return base;
 }
 
+function parseWorkerMeta(raw: unknown): { arch: string | null; cpus: number | null } {
+  if (!isPlainObject(raw)) {
+    return { arch: null, cpus: null };
+  }
+  const arch =
+    typeof raw.arch === "string" && WORKER_ARCH_RE.test(raw.arch)
+      ? raw.arch
+      : null;
+  const cpus =
+    typeof raw.cpus === "number" &&
+    Number.isInteger(raw.cpus) &&
+    raw.cpus >= 1 &&
+    raw.cpus <= 1024
+      ? raw.cpus
+      : null;
+  return { arch, cpus };
+}
+
+function touchWorker(
+  db: Database,
+  workerId: string,
+  nowMs: number,
+  action: string,
+  jobId: string | null,
+  meta?: { arch: string | null; cpus: number | null },
+): void {
+  const arch = meta?.arch ?? null;
+  const cpus = meta?.cpus ?? null;
+  db.query(
+    `INSERT INTO workers (worker_id, last_seen_at, last_action, last_job_id, arch, cpus)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(worker_id) DO UPDATE SET
+       last_seen_at = excluded.last_seen_at,
+       last_action = excluded.last_action,
+       last_job_id = COALESCE(excluded.last_job_id, workers.last_job_id),
+       arch = COALESCE(excluded.arch, workers.arch),
+       cpus = COALESCE(excluded.cpus, workers.cpus)`,
+  ).run(workerId, nowMs, action, jobId, arch, cpus);
+}
+
 export function createVmQueueApp(options: VmQueueOptions): VmQueueApp {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 8790;
@@ -428,6 +484,15 @@ export function createVmQueueApp(options: VmQueueOptions): VmQueueApp {
     );
     CREATE INDEX IF NOT EXISTS idx_jobs_status_expires ON jobs(status, expires_at);
     CREATE INDEX IF NOT EXISTS idx_jobs_status_lease ON jobs(status, lease_expires_at);
+    CREATE TABLE IF NOT EXISTS workers (
+      worker_id TEXT PRIMARY KEY,
+      last_seen_at INTEGER NOT NULL,
+      last_action TEXT NOT NULL,
+      last_job_id TEXT,
+      arch TEXT,
+      cpus INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_workers_last_seen ON workers(last_seen_at);
   `);
 
   function emitAuthFailure(
@@ -565,8 +630,8 @@ export function createVmQueueApp(options: VmQueueOptions): VmQueueApp {
       return jsonResponse({ error: "invalid_max_output_bytes" }, 400);
     }
 
-    const inputValue = payload.input === undefined ? {} : payload.input;
-    const inputValidation = validateJobInput(kind, inputValue);
+    const rawInputValue = payload.input === undefined ? {} : payload.input;
+    const inputValidation = validateJobInput(kind, rawInputValue);
     if (!inputValidation.ok) {
       return jsonResponse(
         {
@@ -576,6 +641,13 @@ export function createVmQueueApp(options: VmQueueOptions): VmQueueApp {
         400,
       );
     }
+
+    const inputValue =
+      kind === "repo_check" &&
+      isPlainObject(rawInputValue) &&
+      rawInputValue.preset === undefined
+        ? { ...rawInputValue, preset: "auto" }
+        : rawInputValue;
 
     const inputBuf = Buffer.from(JSON.stringify(inputValue), "utf8");
     if (inputBuf.byteLength > maxInputBytes) {
@@ -673,6 +745,7 @@ export function createVmQueueApp(options: VmQueueOptions): VmQueueApp {
       return jsonResponse({ error: "invalid_lease_sec" }, 400);
     }
 
+    const meta = parseWorkerMeta(payload.meta);
     const nowMs = now();
     const claimed = withImmediateTx(db, () => {
       sweepExpiredAndLeased(db, nowMs);
@@ -694,7 +767,10 @@ export function createVmQueueApp(options: VmQueueOptions): VmQueueApp {
           | "attempts"
         > | null;
 
-      if (!next) return null;
+      if (!next) {
+        touchWorker(db, workerId, nowMs, "claim_empty", null, meta);
+        return null;
+      }
 
       const leaseToken = randomBytes(16).toString("hex");
       const leaseExpiresAt = Math.min(next.expires_at, nowMs + leaseSec * 1000);
@@ -709,6 +785,7 @@ export function createVmQueueApp(options: VmQueueOptions): VmQueueApp {
              attempts = ?
          WHERE job_id = ?`,
       ).run(workerId, leaseToken, leaseExpiresAt, nextAttempts, next.job_id);
+      touchWorker(db, workerId, nowMs, "claim_hit", next.job_id, meta);
 
       return {
         job_id: next.job_id,
@@ -854,6 +931,7 @@ export function createVmQueueApp(options: VmQueueOptions): VmQueueApp {
         nextLeaseExpiresAt,
         jobId,
       );
+      touchWorker(db, workerId, nowMs, "heartbeat", jobId);
       return {
         kind: "ok" as const,
         lease_expires_at: nextLeaseExpiresAt,
@@ -984,6 +1062,7 @@ export function createVmQueueApp(options: VmQueueOptions): VmQueueApp {
                lease_token = NULL
            WHERE job_id = ?`,
         ).run(serializedPayload, nowMs, jobId);
+        touchWorker(db, workerId, nowMs, "complete", jobId);
         return { kind: "ok" as const, status: "completed" as const };
       } else {
         db.query(
@@ -994,6 +1073,7 @@ export function createVmQueueApp(options: VmQueueOptions): VmQueueApp {
                lease_token = NULL
            WHERE job_id = ?`,
         ).run(serializedPayload, nowMs, jobId);
+        touchWorker(db, workerId, nowMs, "fail", jobId);
         return { kind: "ok" as const, status: "failed" as const };
       }
     });
@@ -1136,6 +1216,94 @@ export function createVmQueueApp(options: VmQueueOptions): VmQueueApp {
     return jsonResponse(serializeAdminJob(outcome.row, false), 200);
   }
 
+  async function handleWorkerPing(req: Request): Promise<Response> {
+    const authErr = authenticate(req, "worker");
+    if (authErr) return authErr;
+
+    const bodyRes = await readBodyCapped(req, 16384);
+    if (!bodyRes.ok) {
+      return jsonResponse({ error: "invalid_body" }, 400);
+    }
+
+    let payload: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(bodyRes.text);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return jsonResponse({ error: "invalid_json" }, 400);
+      }
+      payload = parsed as Record<string, unknown>;
+    } catch {
+      return jsonResponse({ error: "invalid_json" }, 400);
+    }
+
+    const workerId = payload.worker_id;
+    if (typeof workerId !== "string" || !WORKER_ID_RE.test(workerId)) {
+      return jsonResponse({ error: "invalid_worker_id" }, 400);
+    }
+
+    const meta = parseWorkerMeta(payload);
+    const nowMs = now();
+    withImmediateTx(db, () => {
+      touchWorker(db, workerId, nowMs, "ping", null, meta);
+    });
+
+    return jsonResponse(
+      {
+        ok: true,
+        worker_id: workerId,
+        last_seen_at: nowMs,
+      },
+      200,
+    );
+  }
+
+  function handleWorkersStatus(req: Request, url: URL): Response {
+    const authErr = authenticate(req, "admin");
+    if (authErr) return authErr;
+
+    const rawWindow = url.searchParams.get("window_sec");
+    let windowSec = DEFAULT_WORKER_WINDOW_SEC;
+    if (rawWindow !== null) {
+      if (!/^\d+$/.test(rawWindow)) {
+        return jsonResponse({ error: "invalid_window_sec" }, 400);
+      }
+      const parsed = Number(rawWindow);
+      if (parsed < 5 || parsed > MAX_WORKER_WINDOW_SEC) {
+        return jsonResponse({ error: "invalid_window_sec" }, 400);
+      }
+      windowSec = parsed;
+    }
+
+    const nowMs = now();
+    const cutoffMs = nowMs - windowSec * 1000;
+    const rows = db
+      .query("SELECT * FROM workers ORDER BY last_seen_at DESC LIMIT 50")
+      .all() as WorkerRow[];
+
+    const workers = rows.map((row) => ({
+      worker_id: row.worker_id,
+      last_seen_at: row.last_seen_at,
+      idle_sec: Math.max(0, Math.floor((nowMs - row.last_seen_at) / 1000)),
+      online: row.last_seen_at >= cutoffMs,
+      last_action: row.last_action,
+      last_job_id: row.last_job_id,
+      arch: row.arch,
+      cpus: row.cpus,
+    }));
+    const onlineCount = workers.filter((w) => w.online).length;
+
+    return jsonResponse(
+      {
+        now: nowMs,
+        window_sec: windowSec,
+        online_count: onlineCount,
+        any_online: onlineCount > 0,
+        workers,
+      },
+      200,
+    );
+  }
+
   const server = Bun.serve({
     hostname: host,
     port,
@@ -1156,6 +1324,12 @@ export function createVmQueueApp(options: VmQueueOptions): VmQueueApp {
       }
       if (method === "POST" && path === "/jobs/claim") {
         return handleClaim(req);
+      }
+      if (method === "POST" && path === "/workers/ping") {
+        return handleWorkerPing(req);
+      }
+      if (method === "GET" && path === "/workers/status") {
+        return handleWorkersStatus(req, url);
       }
 
       const inputMatch = /^\/jobs\/([a-zA-Z0-9_-]{3,64})\/input$/.exec(path);

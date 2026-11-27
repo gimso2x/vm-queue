@@ -115,6 +115,20 @@ describe("vm-queue-cli", () => {
     expect(await run(["--env-file", envPath, "status", "cli-probe-1"])).toBe(0);
     expect(JSON.parse(out.at(-1)!).status).toBe("queued");
 
+    // Default preset=auto when omitted
+    expect(
+      await run([
+        "--env-file",
+        envPath,
+        "submit-repo-check",
+        "--job-id",
+        "cli-auto-1",
+        "--repo",
+        "https://github.com/example-org/sample-repo",
+      ]),
+    ).toBe(0);
+    expect(JSON.parse(out.at(-1)!).kind).toBe("repo_check");
+
     // Invalid input exits non-zero and logs without token
     expect(
       await run([
@@ -127,6 +141,125 @@ describe("vm-queue-cli", () => {
         "git_info",
       ]),
     ).toBe(1);
+
+    const allLogs = [...out, ...err].join("\n");
+    expect(allLogs).not.toContain(ADMIN_TOKEN);
+    expect(allLogs).not.toContain(WORKER_TOKEN);
+  });
+
+  test("workers and offload handle both offline and online worker states", async () => {
+    const { baseUrl, dir } = startApp();
+    const envPath = join(dir, ".env");
+    writeFileSync(
+      envPath,
+      `VM_QUEUE_ADMIN_TOKEN=${ADMIN_TOKEN}\nVM_QUEUE_URL=${baseUrl}\nVM_QUEUE_PUBLIC_URL=http://100.64.0.10:8790\n`,
+      "utf8",
+    );
+
+    const out: string[] = [];
+    const err: string[] = [];
+    const run = (argv: string[]) =>
+      runCli(argv, {
+        env: {},
+        homeDir: dir,
+        stdout: (line) => out.push(line),
+        stderr: (line) => err.push(line),
+        pollIntervalMs: 25,
+      });
+
+    // Offline initially
+    expect(await run(["--env-file", envPath, "workers", "--window", "60"])).toBe(0);
+    expect(JSON.parse(out.at(-1)!).any_online).toBe(false);
+
+    expect(
+      await run([
+        "--env-file",
+        envPath,
+        "offload",
+        "--job-id",
+        "cli-offload-offline-1",
+        "--repo",
+        "https://github.com/example-org/sample-repo",
+      ]),
+    ).toBe(0);
+    const offlinePayload = JSON.parse(out.at(-1)!) as {
+      mode: string;
+      worker_online: boolean;
+      wake_command: string;
+      job: { job_id: string };
+    };
+    expect(offlinePayload.mode).toBe("queued_worker_offline");
+    expect(offlinePayload.worker_online).toBe(false);
+    expect(offlinePayload.job.job_id).toBe("cli-offload-offline-1");
+    expect(offlinePayload.wake_command).toContain("--mode poll --max-idle-sec 1800");
+    expect(offlinePayload.wake_command).toContain("http://100.64.0.10:8790");
+
+    // Register online worker via /workers/ping
+    await fetch(`${baseUrl}/workers/ping`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WORKER_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ worker_id: "cue-online-1", arch: "x86_64", cpus: 8 }),
+    });
+    expect(await run(["--env-file", envPath, "workers", "--window", "60"])).toBe(0);
+    expect(JSON.parse(out.at(-1)!).any_online).toBe(true);
+
+    // Simulate worker processing cli-offload-offline-1 and then cli-offload-online-1
+    const simulateWorkerDrain = async () => {
+      await new Promise((r) => setTimeout(r, 30));
+      for (;;) {
+        const c = (await (
+          await fetch(`${baseUrl}/jobs/claim`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${WORKER_TOKEN}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ worker_id: "cue-online-1" }),
+          })
+        ).json()) as { job: { job_id: string; lease_token: string } | null };
+        if (!c.job) break;
+        await fetch(`${baseUrl}/jobs/${c.job.job_id}/complete`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${WORKER_TOKEN}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            worker_id: "cue-online-1",
+            lease_token: c.job.lease_token,
+            output: { passed: true, summary: "ok" },
+          }),
+        });
+      }
+    };
+
+    const workerTask = simulateWorkerDrain();
+    const offloadCode = await run([
+      "--env-file",
+      envPath,
+      "offload",
+      "--job-id",
+      "cli-offload-online-1",
+      "--repo",
+      "https://github.com/example-org/sample-repo",
+      "--wait",
+      "10",
+    ]);
+    await workerTask;
+    expect(offloadCode).toBe(0);
+
+    const onlinePayload = JSON.parse(out.at(-1)!) as {
+      mode: string;
+      worker_online: boolean;
+      job: { job_id: string; status: string };
+    };
+    expect(onlinePayload.mode).toBe("auto_completed");
+    expect(onlinePayload.worker_online).toBe(true);
+    expect(onlinePayload.job.job_id).toBe("cli-offload-online-1");
+    expect(onlinePayload.job.status).toBe("completed");
 
     const allLogs = [...out, ...err].join("\n");
     expect(allLogs).not.toContain(ADMIN_TOKEN);

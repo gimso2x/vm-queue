@@ -92,6 +92,65 @@ class VmWorkerUnitTest(unittest.TestCase):
         self.assertNotIn("GITHUB_TOKEN", cleaned)
         self.assertNotIn("OPENAI_API_KEY", cleaned)
 
+    def test_detect_auto_preset_and_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+
+            # Plain repo -> git_info
+            (root / "README.md").write_text("# plain\n", encoding="utf-8")
+            p, reason, _ = vm_worker.detect_auto_preset(
+                str(root), {}, "tok", available_tools={"bun", "pytest", "go", "cargo"}
+            )
+            self.assertEqual((p, reason), ("git_info", "no_recognized_test_manifest"))
+
+            # package.json check -> bun_check when bun available, else git_info fallback
+            (root / "package.json").write_text(
+                json.dumps({"scripts": {"check": "bun test", "test": "bun test"}}),
+                encoding="utf-8",
+            )
+            p, reason, _ = vm_worker.detect_auto_preset(
+                str(root), {}, "tok", available_tools={"bun"}
+            )
+            self.assertEqual((p, reason), ("bun_check", None))
+            p, reason, _ = vm_worker.detect_auto_preset(
+                str(root), {}, "tok", available_tools=set()
+            )
+            self.assertEqual((p, reason), ("git_info", "toolchain_not_installed:bun"))
+            (root / "package.json").unlink()
+
+            # pyproject.toml -> pytest or fallback
+            (root / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+            p, reason, _ = vm_worker.detect_auto_preset(
+                str(root), {}, "tok", available_tools={"pytest"}
+            )
+            self.assertEqual((p, reason), ("pytest", None))
+            p, reason, _ = vm_worker.detect_auto_preset(
+                str(root), {}, "tok", available_tools=set()
+            )
+            self.assertEqual((p, reason), ("git_info", "toolchain_not_installed:pytest"))
+            (root / "pyproject.toml").unlink()
+
+            # go.mod -> go_test or fallback
+            (root / "go.mod").write_text("module example.com/m\n", encoding="utf-8")
+            p, reason, _ = vm_worker.detect_auto_preset(
+                str(root), {}, "tok", available_tools=set()
+            )
+            self.assertEqual((p, reason), ("git_info", "toolchain_not_installed:go"))
+            (root / "go.mod").unlink()
+
+            # Cargo.toml -> cargo_test or fallback
+            (root / "Cargo.toml").write_text("[package]\nname='x'\n", encoding="utf-8")
+            p, reason, _ = vm_worker.detect_auto_preset(
+                str(root), {}, "tok", available_tools=set()
+            )
+            self.assertEqual((p, reason), ("git_info", "toolchain_not_installed:cargo"))
+
+    def test_max_idle_sec_capped_at_3600(self) -> None:
+        code = vm_worker.main(
+            ["--url", "http://127.0.0.1:8790", "--max-idle-sec", "7200"]
+        )
+        self.assertEqual(code, 2)
+
 
 class VmWorkerIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -285,6 +344,39 @@ class VmWorkerIntegrationTest(unittest.TestCase):
         job3 = self._admin_req("/jobs/int-repo-fail-1")
         self.assertEqual(job3["status"], "failed")
         self.assertIn("simulated missing toolchain", job3["error"])
+
+        # 4. preset=auto falls back safely when runtime absent & worker presence is recorded
+        pkg_repo = Path(self.tmpdir) / "pkg-git"
+        pkg_repo.mkdir()
+        (pkg_repo / "package.json").write_text(
+            json.dumps({"scripts": {"test": "echo ok"}}), encoding="utf-8"
+        )
+        subprocess.run(["git", "init", "-b", "main"], cwd=pkg_repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=pkg_repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=pkg_repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", "package.json"], cwd=pkg_repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add pkg"], cwd=pkg_repo, check=True, capture_output=True)
+
+        auto_out = vm_worker.process_repo_check(
+            {"repo_url": "https://github.com/example-org/sample-repo", "preset": "auto"},
+            token=self.worker_token,
+            clean_env=vm_worker.build_clean_env(),
+            clone_fn=lambda _u, d, _r, e, t, k: vm_worker.clone_github_repo(
+                str(pkg_repo), d, None, e, t, k
+            ),
+            available_tools_override=set(),
+        )
+        self.assertTrue(auto_out["passed"])
+        self.assertEqual(auto_out["requested_preset"], "auto")
+        self.assertEqual(auto_out["resolved_preset"], "git_info")
+        self.assertEqual(auto_out["fallback_reason"], "toolchain_not_installed:bun")
+
+        # Worker presence recorded by previous claims
+        workers_status = self._admin_req("/workers/status?window_sec=60")
+        self.assertTrue(workers_status["any_online"])
+        self.assertEqual(workers_status["workers"][0]["worker_id"], "cue-int-1")
+        self.assertTrue(workers_status["workers"][0]["arch"])
+        self.assertGreaterEqual(workers_status["workers"][0]["cpus"], 1)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from collections import Counter
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import socket
@@ -27,7 +28,7 @@ GITHUB_PUBLIC_REPO_RE = re.compile(
 GIT_REF_RE = re.compile(r"^[A-Za-z0-9._/-]{1,128}$")
 ALLOWED_REPO_CHECK_KEYS = frozenset({"repo_url", "preset", "ref", "timeout_sec"})
 ALLOWED_REPO_CHECK_PRESETS = frozenset(
-    {"git_info", "bun_test", "bun_check", "pytest", "go_test", "cargo_test"}
+    {"auto", "git_info", "bun_test", "bun_check", "pytest", "go_test", "cargo_test"}
 )
 SAFE_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "USER")
 
@@ -135,7 +136,9 @@ def validate_repo_check_input(data: Any) -> dict[str, Any]:
     ):
         raise WorkerInfraError("Invalid GitHub owner or repository name")
 
-    preset = data.get("preset")
+    preset = data.get("preset", "auto")
+    if preset is None:
+        preset = "auto"
     if not isinstance(preset, str) or preset not in ALLOWED_REPO_CHECK_PRESETS:
         raise WorkerInfraError(f"Unsupported repo_check preset: {preset!r}")
 
@@ -273,6 +276,88 @@ def _resolve_tool(name: str, env: dict[str, str]) -> Optional[str]:
     ]
     combined = os.pathsep.join([p for p in search_paths + extra_dirs if p])
     return shutil.which(name, path=combined)
+
+
+def _detect_available_tools(clean_env: dict[str, str], token: str) -> set[str]:
+    found: set[str] = set()
+    for tool in ("bun", "go", "cargo"):
+        if _resolve_tool(tool, clean_env):
+            found.add(tool)
+    if _resolve_tool("pytest", clean_env):
+        found.add("pytest")
+    else:
+        probe_py = _run_subprocess(
+            [sys.executable, "-m", "pytest", "--version"],
+            env=clean_env,
+            timeout_sec=10,
+            token=token,
+        )
+        if probe_py["exit_code"] == 0:
+            found.add("pytest")
+    return found
+
+
+def detect_auto_preset(
+    repo_dir: str,
+    clean_env: dict[str, str],
+    token: str,
+    *,
+    available_tools: Optional[set[str]] = None,
+) -> tuple[str, Optional[str], list[str]]:
+    tools = (
+        set(available_tools)
+        if available_tools is not None
+        else _detect_available_tools(clean_env, token)
+    )
+    sorted_tools = sorted(tools)
+    root = Path(repo_dir)
+
+    pkg_path = root / "package.json"
+    if pkg_path.is_file():
+        desired: Optional[str] = None
+        try:
+            pkg_data = json.loads(pkg_path.read_text(encoding="utf-8"))
+        except Exception:
+            pkg_data = {}
+        if isinstance(pkg_data, dict):
+            scripts = pkg_data.get("scripts")
+            if isinstance(scripts, dict):
+                if isinstance(scripts.get("check"), str) and scripts["check"].strip():
+                    desired = "bun_check"
+                elif isinstance(scripts.get("test"), str) and scripts["test"].strip():
+                    desired = "bun_test"
+        if desired is None and (
+            (root / "bun.lock").is_file() or (root / "bun.lockb").is_file()
+        ):
+            desired = "bun_test"
+        if desired is not None:
+            if "bun" in tools:
+                return desired, None, sorted_tools
+            return "git_info", "toolchain_not_installed:bun", sorted_tools
+
+    tests_dir = root / "tests"
+    has_py_manifest = (
+        (root / "pyproject.toml").is_file()
+        or (root / "pytest.ini").is_file()
+        or (root / "setup.cfg").is_file()
+        or (tests_dir.is_dir() and any(tests_dir.glob("test_*.py")))
+    )
+    if has_py_manifest:
+        if "pytest" in tools:
+            return "pytest", None, sorted_tools
+        return "git_info", "toolchain_not_installed:pytest", sorted_tools
+
+    if (root / "go.mod").is_file():
+        if "go" in tools:
+            return "go_test", None, sorted_tools
+        return "git_info", "toolchain_not_installed:go", sorted_tools
+
+    if (root / "Cargo.toml").is_file():
+        if "cargo" in tools:
+            return "cargo_test", None, sorted_tools
+        return "git_info", "toolchain_not_installed:cargo", sorted_tools
+
+    return "git_info", "no_recognized_test_manifest", sorted_tools
 
 
 def clone_github_repo(
@@ -419,10 +504,11 @@ def process_repo_check(
     clone_fn: Optional[
         Callable[[str, str, Optional[str], dict[str, str], int, str], None]
     ] = None,
+    available_tools_override: Optional[set[str]] = None,
 ) -> dict[str, Any]:
     spec = validate_repo_check_input(raw_input)
     repo_url: str = spec["repo_url"]
-    preset: str = spec["preset"]
+    requested_preset: str = spec["preset"]
     ref: Optional[str] = spec["ref"]
     timeout_sec: int = spec["timeout_sec"]
 
@@ -458,6 +544,18 @@ def process_repo_check(
         head_sha = sha_res["stdout"].strip()
         commit_subject = subj_res["stdout"].strip()
 
+        fallback_reason: Optional[str] = None
+        available_tools: Optional[list[str]] = None
+        if requested_preset == "auto":
+            preset, fallback_reason, available_tools = detect_auto_preset(
+                repo_dir,
+                clean_env,
+                token,
+                available_tools=available_tools_override,
+            )
+        else:
+            preset = requested_preset
+
         info_meta: Optional[dict[str, Any]] = None
         if preset == "git_info":
             info_meta = _collect_git_info(repo_dir, clean_env, token)
@@ -485,23 +583,26 @@ def process_repo_check(
                     passed = False
                     timed_out = bool(install_step["timed_out"])
                     summary = f"{preset}: dependency install failed (exit={install_step['exit_code']})"
-                    return _shrink_output_to_fit(
-                        {
-                            "arch": arch,
-                            "cpus": cpus,
-                            "repo_url": repo_url,
-                            "preset": preset,
-                            "ref": ref,
-                            "head_sha": head_sha,
-                            "commit_subject": commit_subject,
-                            "passed": passed,
-                            "timed_out": timed_out,
-                            "duration_ms": int((time.monotonic() - started) * 1000),
-                            "steps": steps,
-                            "summary": summary,
-                        },
-                        max_output_bytes,
-                    )
+                    fail_output: dict[str, Any] = {
+                        "arch": arch,
+                        "cpus": cpus,
+                        "repo_url": repo_url,
+                        "preset": preset,
+                        "requested_preset": requested_preset,
+                        "resolved_preset": preset,
+                        "ref": ref,
+                        "head_sha": head_sha,
+                        "commit_subject": commit_subject,
+                        "passed": passed,
+                        "timed_out": timed_out,
+                        "duration_ms": int((time.monotonic() - started) * 1000),
+                        "steps": steps,
+                        "summary": summary,
+                    }
+                    if requested_preset == "auto":
+                        fail_output["fallback_reason"] = fallback_reason
+                        fail_output["available_tools"] = available_tools
+                    return _shrink_output_to_fit(fail_output, max_output_bytes)
             run_cmd = (
                 [bun_bin, "test"]
                 if preset == "bun_test"
@@ -589,6 +690,8 @@ def process_repo_check(
             "cpus": cpus,
             "repo_url": repo_url,
             "preset": preset,
+            "requested_preset": requested_preset,
+            "resolved_preset": preset,
             "ref": ref,
             "head_sha": head_sha,
             "commit_subject": commit_subject,
@@ -598,6 +701,9 @@ def process_repo_check(
             "steps": steps,
             "summary": summary,
         }
+        if requested_preset == "auto":
+            output["fallback_reason"] = fallback_reason
+            output["available_tools"] = available_tools
         if info_meta is not None:
             output["file_count"] = info_meta["file_count"]
             output["top_extensions"] = info_meta["top_extensions"]
@@ -619,11 +725,19 @@ def claim_and_process_one(
     ] = None,
 ) -> Optional[dict[str, Any]]:
     base_url = base_url.rstrip("/")
+    worker_meta = {
+        "arch": platform.machine() or "unknown",
+        "cpus": os.cpu_count() or 1,
+    }
     _, _, claim_raw = _http_request(
         f"{base_url}/jobs/claim",
         token,
         method="POST",
-        json_body={"worker_id": worker_id, "lease_sec": lease_sec},
+        json_body={
+            "worker_id": worker_id,
+            "lease_sec": lease_sec,
+            "meta": worker_meta,
+        },
     )
     claim_payload = json.loads(claim_raw.decode("utf-8"))
     job = claim_payload.get("job")
@@ -837,7 +951,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--max-idle-sec",
         type=int,
         default=60,
-        help="Idle timeout in seconds for --mode poll",
+        help="Idle timeout in seconds for --mode poll (1..3600)",
     )
     parser.add_argument(
         "--token-file",
@@ -851,6 +965,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
     if args.lease_sec < 1 or args.lease_sec > 600:
         print("Error: --lease-sec must be between 1 and 600", file=sys.stderr)
+        return 2
+    if args.max_idle_sec < 1 or args.max_idle_sec > 3600:
+        print(
+            "Error: --max-idle-sec must be between 1 and 3600 (finite session polling only; 24/7 keepalive is disallowed)",
+            file=sys.stderr,
+        )
         return 2
 
     worker_id = sanitize_worker_id(args.worker_id)

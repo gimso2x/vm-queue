@@ -894,4 +894,160 @@ describe("vm-queue server", () => {
     });
     expect(rqCompleted.status).toBe(409);
   });
+
+  test("15. Accepts explicit preset=auto and omitted preset (normalizing to auto)", async () => {
+    const { baseUrl } = startTestApp();
+
+    const explicitAuto = await fetch(`${baseUrl}/jobs`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ADMIN_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        job_id: "auto-explicit-1",
+        kind: "repo_check",
+        input: {
+          repo_url: "https://github.com/example-org/sample-repo",
+          preset: "auto",
+        },
+      }),
+    });
+    expect(explicitAuto.status).toBe(201);
+
+    const omittedPreset = await fetch(`${baseUrl}/jobs`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ADMIN_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        job_id: "auto-omitted-1",
+        kind: "repo_check",
+        input: {
+          repo_url: "https://github.com/example-org/sample-repo",
+        },
+      }),
+    });
+    expect(omittedPreset.status).toBe(201);
+
+    // Claim auto-explicit-1 and auto-omitted-1 and verify stored input has preset="auto"
+    for (const expectedId of ["auto-explicit-1", "auto-omitted-1"]) {
+      const claimRes = await fetch(`${baseUrl}/jobs/claim`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${WORKER_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ worker_id: "w-auto" }),
+      });
+      const claimBody = (await claimRes.json()) as {
+        job: { job_id: string; lease_token: string };
+      };
+      expect(claimBody.job.job_id).toBe(expectedId);
+
+      const inputRes = await fetch(`${baseUrl}/jobs/${expectedId}/input`, {
+        headers: {
+          Authorization: `Bearer ${WORKER_TOKEN}`,
+          "X-Worker-Id": "w-auto",
+          "X-Lease-Token": claimBody.job.lease_token,
+        },
+      });
+      expect(inputRes.status).toBe(200);
+      expect(await inputRes.json()).toEqual({
+        repo_url: "https://github.com/example-org/sample-repo",
+        preset: "auto",
+      });
+    }
+  });
+
+  test("16. Tracks worker presence via /workers/ping, /jobs/claim meta, and /workers/status", async () => {
+    let nowMs = 1_700_000_000_000;
+    const { baseUrl } = startTestApp(() => nowMs);
+
+    // Role separation checks
+    const adminOnPing = await fetch(`${baseUrl}/workers/ping`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ADMIN_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ worker_id: "w1" }),
+    });
+    expect(adminOnPing.status).toBe(403);
+
+    const workerOnStatus = await fetch(`${baseUrl}/workers/status`, {
+      headers: { Authorization: `Bearer ${WORKER_TOKEN}` },
+    });
+    expect(workerOnStatus.status).toBe(403);
+
+    // Ping registers worker
+    const pingRes = await fetch(`${baseUrl}/workers/ping`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WORKER_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ worker_id: "cue-vm-1", arch: "x86_64", cpus: 8 }),
+    });
+    expect(pingRes.status).toBe(200);
+
+    // Claim updates metadata and last_action
+    nowMs += 10_000;
+    await fetch(`${baseUrl}/jobs/claim`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WORKER_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        worker_id: "cue-vm-1",
+        meta: { arch: "x86_64", cpus: 8 },
+      }),
+    });
+
+    nowMs += 20_000;
+    const statusOnline = (await (
+      await fetch(`${baseUrl}/workers/status?window_sec=60`, {
+        headers: { Authorization: `Bearer ${ADMIN_TOKEN}` },
+      })
+    ).json()) as {
+      online_count: number;
+      any_online: boolean;
+      workers: Array<{
+        worker_id: string;
+        idle_sec: number;
+        online: boolean;
+        last_action: string;
+        arch: string;
+        cpus: number;
+      }>;
+    };
+    expect(statusOnline.online_count).toBe(1);
+    expect(statusOnline.any_online).toBe(true);
+    expect(statusOnline.workers[0]).toMatchObject({
+      worker_id: "cue-vm-1",
+      idle_sec: 20,
+      online: true,
+      last_action: "claim_empty",
+      arch: "x86_64",
+      cpus: 8,
+    });
+
+    // Advance past 60s window -> offline
+    nowMs += 50_000;
+    const statusOffline = (await (
+      await fetch(`${baseUrl}/workers/status?window_sec=60`, {
+        headers: { Authorization: `Bearer ${ADMIN_TOKEN}` },
+      })
+    ).json()) as {
+      online_count: number;
+      any_online: boolean;
+      workers: Array<{ online: boolean; idle_sec: number }>;
+    };
+    expect(statusOffline.online_count).toBe(0);
+    expect(statusOffline.any_online).toBe(false);
+    expect(statusOffline.workers[0].online).toBe(false);
+    expect(statusOffline.workers[0].idle_sec).toBe(70);
+  });
 });
